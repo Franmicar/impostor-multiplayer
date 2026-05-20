@@ -328,6 +328,18 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     client.to(data.code).emit('stroke', data.stroke);
   }
 
+  @SubscribeMessage('submit-drawing')
+  handleSubmitDrawing(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { code: string; drawing: string },
+  ) {
+    const room = this.rooms.get(data.code.toUpperCase());
+    if (!room) return;
+    room.drawings.push(data.drawing);
+    this.server.to(data.code).emit('room-state', this.sanitizeRoomState(room));
+    console.log(`Dibujo recibido en sala ${data.code}`);
+  }
+
   @SubscribeMessage('submit-vote')
   handleSubmitVote(
     @ConnectedSocket() client: Socket,
