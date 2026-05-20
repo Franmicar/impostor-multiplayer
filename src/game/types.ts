@@ -27,10 +27,27 @@ export interface RoomState {
   code: string;
   settings: GameSettings;
   players: Player[];
-  status: 'lobby' | 'reveal' | 'play' | 'vote' | 'results';
+  status: 'lobby' | 'reveal' | 'play' | 'vote' | 'vote-resolved' | 'results';
   secretWord: { word: string; hint: string; fakeWord?: string } | null;
   startingPlayerId: string | null;
   currentPlayerIndex: number;
   eliminationsCount: number;
   drawings: string[];
+  votingState?: {
+    votes: { [voterId: string]: string }; // voterId -> targetId
+    timeLeft: number;
+    totalTime: number;
+    resolution?: {
+      eliminatedPlayerId: string | null;
+      eliminatedPlayerName: string;
+      isImpostor: boolean;
+      isTie: boolean;
+      voteCounts: { [targetId: string]: number };
+      timeLeft: number;
+      isGuessFail?: boolean;
+      guessWord?: string;
+    };
+  };
+  winnerTeam?: 'town' | 'impostors' | null;
+  resultsData?: any;
 }

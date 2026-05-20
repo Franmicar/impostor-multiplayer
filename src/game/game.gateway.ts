@@ -23,6 +23,8 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private rooms = new Map<string, RoomState>();
   // Control de desconexión temporal de 45 segundos por jugador
   private disconnectTimeouts = new Map<string, NodeJS.Timeout>();
+  // Control de temporizadores de votación online
+  private votingIntervals = new Map<string, NodeJS.Timeout>();
 
   handleConnection(client: Socket) {
     console.log(`Cliente conectado: ${client.id}`);
@@ -340,13 +342,66 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     console.log(`Dibujo recibido en sala ${data.code}`);
   }
 
-  @SubscribeMessage('submit-vote')
-  handleSubmitVote(
+  @SubscribeMessage('start-voting')
+  handleStartVoting(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { code: string; vote: { voterId: string; targetId: string } },
+    @MessageBody() data: { code: string },
   ) {
-    // Retransmitir votos en tiempo real a la sala
-    this.server.to(data.code).emit('player-voted', data.vote);
+    const room = this.rooms.get(data.code.toUpperCase());
+    if (!room) return;
+
+    const host = room.players.find(p => p.socketId === client.id);
+    if (!host || !host.isHost) return;
+
+    const durationMinutes = parseInt(room.settings.duration || '0', 10);
+    const timeLeft = durationMinutes > 0 ? durationMinutes * 60 : 0;
+
+    room.status = 'vote';
+    room.votingState = {
+      votes: {},
+      timeLeft,
+      totalTime: timeLeft,
+    };
+    
+    room.winnerTeam = undefined;
+    room.resultsData = undefined;
+
+    this.server.to(data.code.toUpperCase()).emit('room-state', this.sanitizeRoomState(room));
+    console.log(`Iniciando votación en sala ${data.code}. Tiempo: ${timeLeft}s`);
+
+    if (timeLeft > 0) {
+      this.startVotingTimer(data.code.toUpperCase());
+    }
+  }
+
+  @SubscribeMessage('cast-vote')
+  handleCastVote(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { code: string; targetId: string },
+  ) {
+    const code = data.code.toUpperCase();
+    const room = this.rooms.get(code);
+    if (!room || room.status !== 'vote' || !room.votingState) return;
+
+    const player = room.players.find(p => p.socketId === client.id);
+    if (!player || player.isEliminated || player.status !== 'active') return;
+
+    // A player can only vote once
+    if (room.votingState.votes[player.id]) return;
+
+    room.votingState.votes[player.id] = data.targetId;
+    console.log(`Voto registrado en sala ${code}: ${player.name} -> ${data.targetId}`);
+
+    // Check if all active alive players have voted
+    const activeAlivePlayers = room.players.filter(p => p.status === 'active' && !p.isEliminated);
+    const totalVotesCast = Object.keys(room.votingState.votes).length;
+
+    if (totalVotesCast >= activeAlivePlayers.length) {
+      this.clearVotingTimer(code);
+      this.resolveVoting(code);
+    } else {
+      this.server.to(code).emit('room-state', this.sanitizeRoomState(room));
+    }
   }
 
   @SubscribeMessage('submit-guess')
@@ -354,15 +409,75 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { code: string; guess: { detectiveId: string; word: string } },
   ) {
-    const room = this.rooms.get(data.code);
+    const code = data.code.toUpperCase();
+    const room = this.rooms.get(code);
     if (!room) return;
 
+    const detectivePlayer = room.players.find(p => p.id === data.guess.detectiveId);
+    if (!detectivePlayer || detectivePlayer.isEliminated || !detectivePlayer.isDetective) return;
+
     const isCorrect = room.secretWord?.word.toLowerCase().trim() === data.guess.word.toLowerCase().trim();
-    this.server.to(data.code).emit('guess-result', {
+    
+    // Broadcast the guess results event so clients can play sounds/animations
+    this.server.to(code).emit('guess-result', {
       detectiveId: data.guess.detectiveId,
       word: data.guess.word,
       isCorrect,
     });
+
+    if (isCorrect) {
+      // Detective wins the game for the town!
+      this.clearVotingTimer(code);
+      room.status = 'results';
+      room.winnerTeam = 'town';
+      room.resultsData = {
+        reason: 'guess',
+        guess: data.guess.word,
+        detectiveId: data.guess.detectiveId,
+      };
+      this.server.to(code).emit('room-state', this.sanitizeRoomState(room));
+      console.log(`Partida terminada en sala ${code}: Detective adivinó correctamente la palabra.`);
+    } else {
+      // Detective guess failed: eliminate detective
+      detectivePlayer.isEliminated = true;
+      room.eliminationsCount++;
+      console.log(`Detective ${detectivePlayer.name} falló adivinación y es eliminado en sala ${code}`);
+
+      // Check win conditions
+      const winResult = this.checkWinConditionsOnServer(room);
+      if (winResult) {
+        this.clearVotingTimer(code);
+        room.status = 'results';
+        room.winnerTeam = winResult.winner;
+        room.resultsData = {
+          reason: 'guess', // will display guess fail message because winner is impostors
+          guess: data.guess.word,
+          detectiveId: data.guess.detectiveId,
+        };
+        this.server.to(code).emit('room-state', this.sanitizeRoomState(room));
+      } else {
+        // Game continues: enter vote-resolved phase for 6 seconds
+        this.clearVotingTimer(code);
+        room.status = 'vote-resolved';
+        room.votingState = {
+          votes: room.votingState?.votes || {},
+          timeLeft: 6,
+          totalTime: 6,
+          resolution: {
+            eliminatedPlayerId: detectivePlayer.id,
+            eliminatedPlayerName: detectivePlayer.name,
+            isImpostor: false,
+            isTie: false,
+            voteCounts: {},
+            timeLeft: 6,
+            isGuessFail: true,
+            guessWord: data.guess.word,
+          }
+        };
+        this.server.to(code).emit('room-state', this.sanitizeRoomState(room));
+        this.startResolutionTimer(code);
+      }
+    }
   }
 
   @SubscribeMessage('reset-game')
@@ -370,11 +485,14 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { code: string },
   ) {
-    const room = this.rooms.get(data.code);
+    const code = data.code.toUpperCase();
+    const room = this.rooms.get(code);
     if (!room) return;
 
     const host = room.players.find(p => p.socketId === client.id);
     if (!host || !host.isHost) return;
+
+    this.clearVotingTimer(code);
 
     room.status = 'lobby';
     room.secretWord = null;
@@ -382,6 +500,10 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     room.currentPlayerIndex = 0;
     room.eliminationsCount = 0;
     room.drawings = [];
+    room.votingState = undefined;
+    room.winnerTeam = undefined;
+    room.resultsData = undefined;
+    
     room.players.forEach(p => {
       p.isImpostor = false;
       p.isDetective = false;
@@ -389,8 +511,223 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
       p.isEliminated = false;
     });
 
-    this.server.to(data.code).emit('room-state', this.sanitizeRoomState(room));
-    console.log(`Sala resetada a Lobby: ${data.code}`);
+    this.server.to(code).emit('room-state', this.sanitizeRoomState(room));
+    console.log(`Sala resetada a Lobby: ${code}`);
+  }
+
+  // --- MÉTODOS DE VOTO Y TEMPORIZADOR AUTORITATIVOS ---
+
+  private startVotingTimer(code: string) {
+    this.clearVotingTimer(code);
+
+    const interval = setInterval(() => {
+      const room = this.rooms.get(code);
+      if (!room || room.status !== 'vote' || !room.votingState) {
+        this.clearVotingTimer(code);
+        return;
+      }
+
+      if (room.votingState.timeLeft > 0) {
+        room.votingState.timeLeft--;
+        this.server.to(code).emit('room-state', this.sanitizeRoomState(room));
+      } else {
+        this.clearVotingTimer(code);
+        this.resolveVoting(code);
+      }
+    }, 1000);
+
+    this.votingIntervals.set(code, interval);
+  }
+
+  private startResolutionTimer(code: string) {
+    this.clearVotingTimer(code); // Safe clear
+
+    const interval = setInterval(() => {
+      const room = this.rooms.get(code);
+      if (!room || room.status !== 'vote-resolved' || !room.votingState || !room.votingState.resolution) {
+        this.clearVotingTimer(code);
+        return;
+      }
+
+      if (room.votingState.resolution.timeLeft > 0) {
+        room.votingState.resolution.timeLeft--;
+        this.server.to(code).emit('room-state', this.sanitizeRoomState(room));
+      } else {
+        this.clearVotingTimer(code);
+        
+        // Transition back to 'play' status automatically
+        room.status = 'play';
+        room.votingState = undefined;
+
+        // Choose a new random starting player from alive ones
+        const activeList = room.players.filter(p => p.status === 'active' && !p.isEliminated);
+        if (activeList.length > 0) {
+          const startingPlayer = activeList[Math.floor(Math.random() * activeList.length)];
+          room.startingPlayerId = startingPlayer.id;
+        }
+
+        // Send role updates to any reconnecting / existing players to refresh their views
+        room.players.forEach(p => {
+          if (p.socketId) {
+            const socketClient = this.server.sockets.sockets.get(p.socketId);
+            if (socketClient) {
+              this.sendIndividualRole(socketClient, p, room);
+            }
+          }
+        });
+
+        this.server.to(code).emit('room-state', this.sanitizeRoomState(room));
+        console.log(`Transición automática de resolución a nueva ronda de discusión en sala ${code}`);
+      }
+    }, 1000);
+
+    this.votingIntervals.set(code, interval);
+  }
+
+  private clearVotingTimer(code: string) {
+    const interval = this.votingIntervals.get(code);
+    if (interval) {
+      clearInterval(interval);
+      this.votingIntervals.delete(code);
+    }
+  }
+
+  private resolveVoting(code: string) {
+    const room = this.rooms.get(code);
+    if (!room || !room.votingState) return;
+
+    const votes = room.votingState.votes;
+    const voteCounts: { [targetId: string]: number } = {};
+
+    Object.values(votes).forEach(targetId => {
+      voteCounts[targetId] = (voteCounts[targetId] || 0) + 1;
+    });
+
+    let maxVotes = 0;
+    let candidatesWithMaxVotes: string[] = [];
+
+    Object.entries(voteCounts).forEach(([targetId, count]) => {
+      if (count > maxVotes) {
+        maxVotes = count;
+        candidatesWithMaxVotes = [targetId];
+      } else if (count === maxVotes) {
+        candidatesWithMaxVotes.push(targetId);
+      }
+    });
+
+    let eliminatedPlayerId: string | null = null;
+    let isTie = false;
+
+    if (candidatesWithMaxVotes.length === 0) {
+      isTie = true;
+    } else if (candidatesWithMaxVotes.length > 1) {
+      isTie = true;
+    } else {
+      eliminatedPlayerId = candidatesWithMaxVotes[0];
+    }
+
+    let eliminatedPlayerName = '';
+    let isImpostor = false;
+
+    if (eliminatedPlayerId && !isTie) {
+      const player = room.players.find(p => p.id === eliminatedPlayerId);
+      if (player) {
+        player.isEliminated = true;
+        room.eliminationsCount++;
+        eliminatedPlayerName = player.name;
+        isImpostor = player.isImpostor;
+        console.log(`Votación en sala ${code}: Jugador ${player.name} fue eliminado.`);
+      }
+    } else {
+      console.log(`Votación en sala ${code}: Empate, nadie es eliminado.`);
+    }
+
+    // Check win conditions after elimination
+    const winResult = this.checkWinConditionsOnServer(room);
+
+    if (winResult) {
+      // Set to results screen immediately
+      room.status = 'results';
+      room.winnerTeam = winResult.winner;
+      room.resultsData = {
+        reason: 'vote',
+        eliminatedPlayerId,
+        eliminatedPlayerName,
+        isImpostor,
+        isTie,
+        voteCounts,
+      };
+      this.server.to(code).emit('room-state', this.sanitizeRoomState(room));
+      console.log(`Partida terminada en sala ${code}: Ganó el equipo ${winResult.winner}`);
+    } else {
+      // Game continues: enter vote-resolved phase for 6 seconds
+      room.status = 'vote-resolved';
+      room.votingState = {
+        votes,
+        timeLeft: 6,
+        totalTime: 6,
+        resolution: {
+          eliminatedPlayerId,
+          eliminatedPlayerName,
+          isImpostor,
+          isTie,
+          voteCounts,
+          timeLeft: 6,
+        }
+      };
+      this.server.to(code).emit('room-state', this.sanitizeRoomState(room));
+      this.startResolutionTimer(code);
+    }
+  }
+
+  private checkWinConditionsOnServer(room: RoomState): { winner: 'town' | 'impostors'; reason?: string } | null {
+    const alivePlayers = room.players.filter(p => p.status === 'active' && !p.isEliminated);
+    const aliveImpostors = alivePlayers.filter(p => p.isImpostor).length;
+    const aliveTownies = alivePlayers.length - aliveImpostors;
+    const originalImpostors = room.players.filter(p => p.isImpostor).length;
+    const aliveDetectives = alivePlayers.filter(p => p.isDetective).length;
+    const totalOriginalPlayers = room.players.length;
+    const eliminations = room.eliminationsCount;
+    const modeId = room.settings.modeId;
+
+    if (modeId === 'chaos') {
+      if (originalImpostors === 0) {
+        if (eliminations >= 1) {
+          return { winner: 'town' };
+        }
+        return null;
+      }
+
+      if (originalImpostors === totalOriginalPlayers) {
+        if (eliminations >= 2) {
+          return { winner: 'impostors' };
+        }
+        return null;
+      }
+
+      if (aliveImpostors === 0) {
+        return { winner: 'town' };
+      }
+      if (aliveTownies === 0) {
+        return { winner: 'impostors' };
+      }
+      return null;
+    }
+
+    if (originalImpostors === 0) {
+      if (aliveDetectives === 0) {
+        return { winner: 'town' };
+      }
+      return null;
+    }
+
+    if (aliveImpostors === 0) {
+      return { winner: 'town' };
+    } else if (aliveImpostors >= aliveTownies) {
+      return { winner: 'impostors' };
+    }
+
+    return null;
   }
 
   // --- MÉTODOS DE AYUDA PRIVADOS ---
@@ -452,6 +789,7 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
       if (room.players.length === 0) {
         // Eliminar sala vacía
+        this.clearVotingTimer(code);
         this.rooms.delete(code);
         console.log(`Sala vacía eliminada: ${code}`);
       } else {
@@ -488,6 +826,9 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
         status: p.status,
         // Omitimos isImpostor e isDetective para que no se puedan hackear en el cliente
       })),
+      votingState: room.votingState,
+      winnerTeam: room.winnerTeam,
+      resultsData: room.resultsData,
     };
   }
 }
