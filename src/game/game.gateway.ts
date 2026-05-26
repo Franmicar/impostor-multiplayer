@@ -9,6 +9,7 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import { RoomState, Player, GameSettings } from './types';
+import { AccessToken } from 'livekit-server-sdk';
 
 @WebSocketGateway({
   cors: {
@@ -107,7 +108,7 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('join-room')
-  handleJoinRoom(
+  async handleJoinRoom(
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { code: string; player: { id: string; name: string; photoUrl?: string } },
   ) {
@@ -138,6 +139,17 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
       // Si el juego está activo, volver a enviarle su rol individual de manera segura
       if (room.status !== 'lobby') {
         this.sendIndividualRole(client, existingPlayer, room);
+        
+        // Enviar también el token de LiveKit si la partida está en la fase de votación/discusión
+        if (room.status === 'vote') {
+          try {
+            const serverUrl = process.env.LIVEKIT_URL || 'ws://localhost:7800';
+            const token = await this.generateLiveKitToken(room.code, existingPlayer.id, existingPlayer.name);
+            client.emit('voice-token', { token, serverUrl });
+          } catch (err) {
+            console.error(`Error al enviar token de voz en reconexión a ${existingPlayer.name}:`, err);
+          }
+        }
       }
     } else {
       // Unirse por primera vez
@@ -368,6 +380,22 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     this.server.to(data.code.toUpperCase()).emit('room-state', this.sanitizeRoomState(room));
     console.log(`Iniciando votación en sala ${data.code}. Tiempo: ${timeLeft}s`);
+
+    // Emitir tokens de LiveKit a cada jugador activo conectado para el chat de voz
+    const serverUrl = process.env.LIVEKIT_URL || 'ws://localhost:7800';
+    room.players.forEach(async p => {
+      if (p.socketId && p.status === 'active' && !p.isEliminated) {
+        try {
+          const token = await this.generateLiveKitToken(room.code, p.id, p.name);
+          const socketClient = this.server.sockets.sockets.get(p.socketId);
+          if (socketClient) {
+            socketClient.emit('voice-token', { token, serverUrl });
+          }
+        } catch (err) {
+          console.error(`Error generando token de voz para ${p.name}:`, err);
+        }
+      }
+    });
 
     if (timeLeft > 0) {
       this.startVotingTimer(data.code.toUpperCase());
@@ -731,6 +759,25 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   // --- MÉTODOS DE AYUDA PRIVADOS ---
+
+  private async generateLiveKitToken(roomCode: string, playerId: string, playerName: string): Promise<string> {
+    const apiKey = process.env.LIVEKIT_API_KEY || 'devkey';
+    const apiSecret = process.env.LIVEKIT_API_SECRET || 'secret';
+
+    const at = new AccessToken(apiKey, apiSecret, {
+      identity: playerId,
+      name: playerName,
+    });
+
+    at.addGrant({
+      roomJoin: true,
+      room: roomCode,
+      canPublish: true,
+      canSubscribe: true,
+    });
+
+    return await at.toJwt();
+  }
 
   private generateRoomCode(): string {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
