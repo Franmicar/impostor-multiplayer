@@ -200,14 +200,18 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   private startGameInternal(room: RoomState, client: Socket): boolean {
+    console.log(`[START_GAME_INTERNAL] Iniciando partida en la sala ${room.code}`);
     const { words, numImpostors, numDetectives, modeId } = room.settings;
     if (!words || words.length === 0) {
+      console.log(`[START_GAME_INTERNAL] ERROR: Lista de palabras vacía o no sincronizada.`);
       client.emit('error-msg', 'LISTA_PALABRAS_VACIA');
       return false;
     }
 
     const activePlayers = room.players.filter(p => p.status === 'active');
+    console.log(`[START_GAME_INTERNAL] Jugadores activos totales: ${activePlayers.length}`);
     if (activePlayers.length < 3) {
+      console.log(`[START_GAME_INTERNAL] ERROR: Menos de 3 jugadores activos (${activePlayers.length}).`);
       client.emit('error-msg', 'MINIMO_3_JUGADORES');
       return false;
     }
@@ -215,6 +219,7 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // Seleccionar palabra al azar
     const randomWordObj = words[Math.floor(Math.random() * words.length)];
     room.secretWord = randomWordObj;
+    console.log(`[START_GAME_INTERNAL] Palabra seleccionada: ${randomWordObj.word}`);
 
     // Resetear roles en todos los jugadores
     room.players.forEach(p => {
@@ -229,6 +234,7 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const finalImpostorsCount = modeId === 'chaos' 
       ? Math.floor(Math.random() * (activePlayers.length + 1)) 
       : numImpostors;
+    console.log(`[START_GAME_INTERNAL] Asignando ${finalImpostorsCount} impostores en modo ${modeId}`);
 
     while (assignedImpostors < finalImpostorsCount && assignedImpostors < activePlayers.length) {
       const randomIndex = Math.floor(Math.random() * room.players.length);
@@ -241,6 +247,7 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     // Asignar detectives (no pueden ser impostores)
     let assignedDetectives = 0;
+    console.log(`[START_GAME_INTERNAL] Asignando ${numDetectives} detectives`);
     while (assignedDetectives < numDetectives && (assignedImpostors + assignedDetectives) < activePlayers.length) {
       const randomIndex = Math.floor(Math.random() * room.players.length);
       const player = room.players[randomIndex];
@@ -254,6 +261,7 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const activeList = room.players.filter(p => p.status === 'active');
     const startingPlayer = activeList[Math.floor(Math.random() * activeList.length)];
     room.startingPlayerId = startingPlayer.id;
+    console.log(`[START_GAME_INTERNAL] Jugador inicial asignado: ${startingPlayer.name} (${startingPlayer.id})`);
 
     room.status = 'reveal';
     room.currentPlayerIndex = 0;
@@ -266,13 +274,17 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     // Emitir el estado genérico a la sala sin campos sensibles
     this.server.to(room.code).emit('room-state', this.sanitizeRoomState(room));
+    console.log(`[START_GAME_INTERNAL] room-state emitido a la sala ${room.code}`);
 
     // Enviar payloads individuales seguros a cada socket conectado
     room.players.forEach(p => {
       if (p.socketId) {
         const socketClient = this.server.sockets.sockets.get(p.socketId);
         if (socketClient) {
+          console.log(`[START_GAME_INTERNAL] Enviando rol a ${p.name} (${p.id}) vía socket ${p.socketId}`);
           this.sendIndividualRole(socketClient, p, room);
+        } else {
+          console.log(`[START_GAME_INTERNAL] WARNING: No se encontró el socket del cliente para ${p.name} (${p.socketId})`);
         }
       }
     });
@@ -617,22 +629,43 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: { code: string },
   ) {
     const code = data.code.toUpperCase();
+    console.log(`[START_REMATCH] Recibido start-rematch para sala ${code} de socket: ${client.id}`);
     const room = this.rooms.get(code);
-    if (!room || room.status !== 'results' || !room.rematchState || room.rematchState.status !== 'rematch-check') return;
+    if (!room) {
+      console.log(`[START_REMATCH] ERROR: Sala ${code} no encontrada.`);
+      return;
+    }
+    console.log(`[START_REMATCH] Estado de la sala: status=${room.status}, rematchState=${JSON.stringify(room.rematchState)}`);
+    
+    if (room.status !== 'results' || !room.rematchState || room.rematchState.status !== 'rematch-check') {
+      console.log(`[START_REMATCH] ERROR: Condiciones de estado no se cumplen. status=${room.status}`);
+      return;
+    }
 
     const host = room.players.find(p => p.socketId === client.id);
-    if (!host || !host.isHost) return;
+    if (!host) {
+      console.log(`[START_REMATCH] ERROR: No se encontró ningún jugador con socketId ${client.id}. Listado de jugadores:`, room.players.map(p => ({ id: p.id, name: p.name, socketId: p.socketId, isHost: p.isHost })));
+      return;
+    }
+    if (!host.isHost) {
+      console.log(`[START_REMATCH] ERROR: El jugador ${host.name} no es el anfitrión de la sala.`);
+      return;
+    }
 
     const readyActivePlayers = room.players.filter(
       p => p.status === 'active' && room.rematchState.readyPlayers.includes(p.id)
     );
+    console.log(`[START_REMATCH] Jugadores listos y activos: ${readyActivePlayers.length}. IDs:`, readyActivePlayers.map(p => p.id));
 
     if (readyActivePlayers.length < 3) {
+      console.log(`[START_REMATCH] ERROR: Menos de 3 jugadores preparados.`);
       client.emit('error-msg', 'MINIMO_3_JUGADORES');
       return;
     }
 
-    this.startGameInternal(room, client);
+    console.log(`[START_REMATCH] Todo listo. Llamando a startGameInternal...`);
+    const success = this.startGameInternal(room, client);
+    console.log(`[START_REMATCH] Resultado de startGameInternal: ${success}`);
   }
 
   // --- MÉTODOS DE VOTO Y TEMPORIZADOR AUTORITATIVOS ---
