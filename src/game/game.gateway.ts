@@ -158,7 +158,7 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
         return;
       }
 
-      if (room.status !== 'lobby') {
+      if (room.status !== 'lobby' && room.status !== 'results') {
         client.emit('error-msg', 'PARTIDA_YA_EMPEZADA');
         return;
       }
@@ -199,27 +199,17 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.server.to(data.code).emit('room-state', this.sanitizeRoomState(room));
   }
 
-  @SubscribeMessage('start-game')
-  handleStartGame(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { code: string },
-  ) {
-    const room = this.rooms.get(data.code);
-    if (!room) return;
-
-    const host = room.players.find(p => p.socketId === client.id);
-    if (!host || !host.isHost) return;
+  private startGameInternal(room: RoomState, client: Socket): boolean {
+    const { words, numImpostors, numDetectives, modeId } = room.settings;
+    if (!words || words.length === 0) {
+      client.emit('error-msg', 'LISTA_PALABRAS_VACIA');
+      return false;
+    }
 
     const activePlayers = room.players.filter(p => p.status === 'active');
     if (activePlayers.length < 3) {
       client.emit('error-msg', 'MINIMO_3_JUGADORES');
-      return;
-    }
-
-    const { words, numImpostors, numDetectives, modeId } = room.settings;
-    if (!words || words.length === 0) {
-      client.emit('error-msg', 'LISTA_PALABRAS_VACIA');
-      return;
+      return false;
     }
 
     // Seleccionar palabra al azar
@@ -269,9 +259,13 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     room.currentPlayerIndex = 0;
     room.eliminationsCount = 0;
     room.drawings = [];
+    room.votingState = undefined;
+    room.winnerTeam = undefined;
+    room.resultsData = undefined;
+    room.rematchState = undefined;
 
     // Emitir el estado genérico a la sala sin campos sensibles
-    this.server.to(data.code).emit('room-state', this.sanitizeRoomState(room));
+    this.server.to(room.code).emit('room-state', this.sanitizeRoomState(room));
 
     // Enviar payloads individuales seguros a cada socket conectado
     room.players.forEach(p => {
@@ -283,7 +277,22 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
       }
     });
 
-    console.log(`Partida iniciada en la sala ${data.code}. Palabra: ${randomWordObj.word}`);
+    console.log(`Partida iniciada en la sala ${room.code}. Palabra: ${randomWordObj.word}`);
+    return true;
+  }
+
+  @SubscribeMessage('start-game')
+  handleStartGame(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { code: string },
+  ) {
+    const room = this.rooms.get(data.code);
+    if (!room) return;
+
+    const host = room.players.find(p => p.socketId === client.id);
+    if (!host || !host.isHost) return;
+
+    this.startGameInternal(room, client);
   }
 
   @SubscribeMessage('see-role')
@@ -455,15 +464,11 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     if (isCorrect) {
       // Detective wins the game for the town!
-      this.clearVotingTimer(code);
-      room.status = 'results';
-      room.winnerTeam = 'town';
-      room.resultsData = {
+      this.endGameWithResults(room, 'town', {
         reason: 'guess',
         guess: data.guess.word,
         detectiveId: data.guess.detectiveId,
-      };
-      this.server.to(code).emit('room-state', this.sanitizeRoomState(room));
+      });
       console.log(`Partida terminada en sala ${code}: Detective adivinó correctamente la palabra.`);
     } else {
       // Detective guess failed: eliminate detective
@@ -474,15 +479,11 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
       // Check win conditions
       const winResult = this.checkWinConditionsOnServer(room);
       if (winResult) {
-        this.clearVotingTimer(code);
-        room.status = 'results';
-        room.winnerTeam = winResult.winner;
-        room.resultsData = {
-          reason: 'guess', // will display guess fail message because winner is impostors
+        this.endGameWithResults(room, winResult.winner, {
+          reason: 'guess',
           guess: data.guess.word,
           detectiveId: data.guess.detectiveId,
-        };
-        this.server.to(code).emit('room-state', this.sanitizeRoomState(room));
+        });
       } else {
         // Game continues: enter vote-resolved phase for 6 seconds
         this.clearVotingTimer(code);
@@ -508,6 +509,31 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
   }
 
+  private resetRoomToLobby(room: RoomState) {
+    this.clearVotingTimer(room.code);
+
+    room.status = 'lobby';
+    room.secretWord = null;
+    room.startingPlayerId = null;
+    room.currentPlayerIndex = 0;
+    room.eliminationsCount = 0;
+    room.drawings = [];
+    room.votingState = undefined;
+    room.winnerTeam = undefined;
+    room.resultsData = undefined;
+    room.rematchState = undefined;
+
+    room.players.forEach(p => {
+      p.isImpostor = false;
+      p.isDetective = false;
+      p.hasSeenRole = false;
+      p.isEliminated = false;
+    });
+
+    this.server.to(room.code).emit('room-state', this.sanitizeRoomState(room));
+    console.log(`Sala resetada a Lobby: ${room.code}`);
+  }
+
   @SubscribeMessage('reset-game')
   handleResetGame(
     @ConnectedSocket() client: Socket,
@@ -520,27 +546,93 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const host = room.players.find(p => p.socketId === client.id);
     if (!host || !host.isHost) return;
 
-    this.clearVotingTimer(code);
+    this.resetRoomToLobby(room);
+  }
 
-    room.status = 'lobby';
-    room.secretWord = null;
-    room.startingPlayerId = null;
-    room.currentPlayerIndex = 0;
-    room.eliminationsCount = 0;
-    room.drawings = [];
-    room.votingState = undefined;
-    room.winnerTeam = undefined;
-    room.resultsData = undefined;
-    
-    room.players.forEach(p => {
-      p.isImpostor = false;
-      p.isDetective = false;
-      p.hasSeenRole = false;
-      p.isEliminated = false;
-    });
+  @SubscribeMessage('request-rematch')
+  handleRequestRematch(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { code: string },
+  ) {
+    const code = data.code.toUpperCase();
+    const room = this.rooms.get(code);
+    if (!room || room.status !== 'results') return;
+
+    const host = room.players.find(p => p.socketId === client.id);
+    if (!host || !host.isHost) return;
+
+    if (!room.rematchState) {
+      room.rematchState = {
+        status: 'idle',
+        readyPlayers: [],
+        lastActivePlayers: room.players.map(p => ({ id: p.id, name: p.name, photoUrl: p.photoUrl })),
+      };
+    }
+
+    room.rematchState.status = 'rematch-check';
+    room.rematchState.readyPlayers = [host.id];
 
     this.server.to(code).emit('room-state', this.sanitizeRoomState(room));
-    console.log(`Sala resetada a Lobby: ${code}`);
+    console.log(`Fase de revancha iniciada por el host en sala: ${code}`);
+  }
+
+  @SubscribeMessage('player-ready')
+  handlePlayerReady(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { code: string },
+  ) {
+    const code = data.code.toUpperCase();
+    const room = this.rooms.get(code);
+    if (!room || room.status !== 'results' || !room.rematchState || room.rematchState.status !== 'rematch-check') return;
+
+    const player = room.players.find(p => p.socketId === client.id);
+    if (!player) return;
+
+    if (!room.rematchState.readyPlayers.includes(player.id)) {
+      room.rematchState.readyPlayers.push(player.id);
+    }
+
+    this.server.to(code).emit('room-state', this.sanitizeRoomState(room));
+    console.log(`Jugador ${player.name} está listo para revancha en sala: ${code}`);
+  }
+
+  @SubscribeMessage('go-to-setup')
+  handleGoToSetup(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { code: string },
+  ) {
+    const code = data.code.toUpperCase();
+    const room = this.rooms.get(code);
+    if (!room) return;
+
+    const host = room.players.find(p => p.socketId === client.id);
+    if (!host || !host.isHost) return;
+
+    this.resetRoomToLobby(room);
+  }
+
+  @SubscribeMessage('start-rematch')
+  handleStartRematch(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { code: string },
+  ) {
+    const code = data.code.toUpperCase();
+    const room = this.rooms.get(code);
+    if (!room || room.status !== 'results' || !room.rematchState || room.rematchState.status !== 'rematch-check') return;
+
+    const host = room.players.find(p => p.socketId === client.id);
+    if (!host || !host.isHost) return;
+
+    const readyActivePlayers = room.players.filter(
+      p => p.status === 'active' && room.rematchState.readyPlayers.includes(p.id)
+    );
+
+    if (readyActivePlayers.length < 3) {
+      client.emit('error-msg', 'MINIMO_3_JUGADORES');
+      return;
+    }
+
+    this.startGameInternal(room, client);
   }
 
   // --- MÉTODOS DE VOTO Y TEMPORIZADOR AUTORITATIVOS ---
@@ -674,18 +766,14 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const winResult = this.checkWinConditionsOnServer(room);
 
     if (winResult) {
-      // Set to results screen immediately
-      room.status = 'results';
-      room.winnerTeam = winResult.winner;
-      room.resultsData = {
+      this.endGameWithResults(room, winResult.winner, {
         reason: 'vote',
         eliminatedPlayerId,
         eliminatedPlayerName,
         isImpostor,
         isTie,
         voteCounts,
-      };
-      this.server.to(code).emit('room-state', this.sanitizeRoomState(room));
+      });
       console.log(`Partida terminada en sala ${code}: Ganó el equipo ${winResult.winner}`);
     } else {
       // Game continues: enter vote-resolved phase for 6 seconds
@@ -853,6 +941,30 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
   }
 
+  private endGameWithResults(room: RoomState, winnerTeam: 'town' | 'impostors', resultsData: any) {
+    this.clearVotingTimer(room.code);
+    room.status = 'results';
+    room.winnerTeam = winnerTeam;
+    
+    room.resultsData = {
+      ...resultsData,
+      impostorIds: room.players.filter(p => p.isImpostor).map(p => p.id),
+      detectiveIds: room.players.filter(p => p.isDetective).map(p => p.id),
+    };
+
+    room.rematchState = {
+      status: 'idle',
+      readyPlayers: [],
+      lastActivePlayers: room.players.map(p => ({
+        id: p.id,
+        name: p.name,
+        photoUrl: p.photoUrl,
+      })),
+    };
+
+    this.server.to(room.code).emit('room-state', this.sanitizeRoomState(room));
+  }
+
   // Elimina datos confidenciales del estado global que se retransmite a la sala
   private sanitizeRoomState(room: RoomState): any {
     return {
@@ -876,6 +988,7 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
       votingState: room.votingState,
       winnerTeam: room.winnerTeam,
       resultsData: room.resultsData,
+      rematchState: room.rematchState,
     };
   }
 }

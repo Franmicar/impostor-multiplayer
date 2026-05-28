@@ -23,6 +23,12 @@ export interface GameSettings {
   drawTurnTime?: number;
 }
 
+export interface RematchState {
+  status: 'idle' | 'rematch-check';
+  readyPlayers: string[]; // IDs de jugadores que aceptaron revancha
+  lastActivePlayers: { id: string; name: string; photoUrl?: string }[]; // Jugadores al terminar la última partida
+}
+
 export interface RoomState {
   code: string;
   settings: GameSettings;
@@ -50,4 +56,5 @@ export interface RoomState {
   };
   winnerTeam?: 'town' | 'impostors' | null;
   resultsData?: any;
+  rematchState?: RematchState;
 }
