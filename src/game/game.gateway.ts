@@ -195,6 +195,12 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const host = room.players.find(p => p.socketId === client.id);
     if (!host || !host.isHost) return;
 
+    if (room.status !== 'lobby') {
+      console.log(`[SYNC_SETTINGS] Rechazado en sala ${data.code}: la sala no está en lobby. Status actual: ${room.status}`);
+      return;
+    }
+
+    console.log(`[SYNC_SETTINGS] Recibido de host: ${host.name}, Sala: ${data.code}, Status actual: ${room.status}, Words count: ${data.settings?.words?.length || 0}`);
     room.settings = data.settings;
     this.server.to(data.code).emit('room-state', this.sanitizeRoomState(room));
   }
