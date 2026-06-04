@@ -1028,6 +1028,8 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
       winnerTeam: room.winnerTeam,
       resultsData: room.resultsData,
       rematchState: room.rematchState,
+      // Exponemos la palabra secreta únicamente cuando la partida ha finalizado
+      secretWord: room.status === 'results' ? room.secretWord : null,
     };
   }
 }
