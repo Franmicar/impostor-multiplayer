@@ -888,8 +888,12 @@ export class GameGateway implements OnGatewayConnection, OnGatewayDisconnect {
   // --- MÉTODOS DE AYUDA PRIVADOS ---
 
   private async generateLiveKitToken(roomCode: string, playerId: string, playerName: string): Promise<string> {
-    const apiKey = process.env.LIVEKIT_API_KEY || 'devkey';
-    const apiSecret = process.env.LIVEKIT_API_SECRET || 'secret';
+    const apiKey = process.env.LIVEKIT_API_KEY;
+    const apiSecret = process.env.LIVEKIT_API_SECRET;
+
+    if (!apiKey || !apiSecret) {
+      throw new Error('LIVEKIT_API_KEY/LIVEKIT_API_SECRET no configuradas: no se pueden emitir tokens de voz sin credenciales reales.');
+    }
 
     const at = new AccessToken(apiKey, apiSecret, {
       identity: playerId,
